@@ -1,5 +1,5 @@
-/* ===================== TEST DEALER: ONE FILE =====================
-   Fill in the settings below, then run the app. */
+
+/* ===================== TEST DEALER: ONE FILE ===================== */
 const C = {
   PORT: 3000,
   MONGO_URI: "placeholder",
@@ -15,7 +15,7 @@ const C = {
   MAIL_FROM: "Test Dealer <placeholder@example.com>",
   ANTHROPIC_API_KEY: "placeholder",
 };
-for (const k in C) if (process.env[k]) C[k] = process.env[k]; // hosting environment variables override the above
+for (const k in C) if (process.env[k]) C[k] = process.env[k]; // Render's Environment values override the above
 
 const crypto = require("crypto");
 const express = require("express");
@@ -333,18 +333,20 @@ app.post("/api/reset", async (req, res) => {
 app.get("/api/subjects", async (req, res) => res.json(await Question.distinct("subject")));
 app.get("/api/plans", (req, res) => res.json(PLANS));
 
+// Free users: 5 questions in total. Paid users: 40 random questions per exam, avoiding ones they have already seen.
 app.post("/api/exam/start", auth, async (req, res) => {
-  const { subject, year, count } = req.body;
+  const { subject } = req.body;
   const unlimited = hasAccess(req.user, subject);
   const left = freeLeft(req.user);
   if (!unlimited && left === 0) return res.status(402).json({ error: "Your free questions are finished. Please choose a plan to continue." });
 
-  const match = { subject };
-  if (year) match.year = +year;
-  let n = Math.min(+count || 5, 60);
-  if (!unlimited) n = Math.min(n, left);
-
-  const qs = await Question.aggregate([{ $match: match }, { $sample: { size: n } }]);
+  const n = unlimited ? 40 : Math.min(5, left);
+  const seen = await Exam.distinct("questions", { user: req.user._id });
+  let qs = await Question.aggregate([{ $match: { subject, _id: { $nin: seen } } }, { $sample: { size: n } }]);
+  if (qs.length < n) {
+    const more = await Question.aggregate([{ $match: { subject, _id: { $nin: qs.map((q) => q._id) } } }, { $sample: { size: n - qs.length } }]);
+    qs = qs.concat(more);
+  }
   if (!qs.length) return res.status(404).json({ error: "No questions found for that subject" });
 
   if (!unlimited) { req.user.used += qs.length; await req.user.save(); }
@@ -407,7 +409,7 @@ app.get("/api/pay/verify", auth, async (req, res) => {
   res.json(publicUser(req.user));
 });
 
-/* ---------- Admin: page at /admin ---------- */
+/* ---------- Admin: upload page at /admin ---------- */
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -458,47 +460,112 @@ app.post("/api/admin/questions", adminAuth, async (req, res) => {
   res.json({ added: good.length, rejected_item_numbers: bad });
 });
 
-/* ---------- Question generator. Run:  node server.js generate "Physics" 20 ---------- */
-async function generateBatch(subject, n) {
+/* ---------- Bulk question generator (open /generate) ---------- */
+const GEN = { running: false, stop: false, log: [] };
+const say = (m) => { GEN.log.push(new Date().toLocaleTimeString() + "  " + m); if (GEN.log.length > 100) GEN.log.shift(); console.log(m); };
+const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function claude(prompt, max = 4000) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json", "x-api-key": C.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: "claude-sonnet-5-5",
-      max_tokens: 4000,
-      messages: [{ role: "user", content:
-        `Write ${n} ORIGINAL multiple-choice practice questions for the JAMB UTME ${subject} syllabus. Vary the topics and difficulty. ` +
-        `Do not copy real past questions. Each has exactly 4 options and one correct answer, plus a short step-by-step solution ending with "Answer: <letter>". ` +
-        `Reply with ONLY a JSON array, no other text: [{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"..."}] ` +
-        `where "answer" is the index (0-3) of the correct option.` }],
-    }),
+    body: JSON.stringify({ model: "claude-sonnet-5-5", max_tokens: max, messages: [{ role: "user", content: prompt }] }),
   });
   const j = await r.json();
   if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
-  const text = j.content.map((c) => c.text || "").join("").replace(/```json|```/g, "").trim();
-  return JSON.parse(text);
+  return j.content.map((c) => c.text || "").join("").replace(/```json|```/g, "").trim();
 }
 
-async function runGenerate() {
-  const subject = process.argv[3];
-  const total = +process.argv[4] || 10;
-  if (!subject) { console.log('Usage: node server.js generate "Physics" 20'); process.exit(); }
-  await mongoose.connect(C.MONGO_URI);
-  let saved = 0;
-  for (let left = total; left > 0; left -= 10) {
-    try {
-      const items = await generateBatch(subject, Math.min(10, left));
-      const good = items.filter((q) => q.question && Array.isArray(q.options) && q.options.length === 4 &&
-        Number.isInteger(q.answer) && q.answer >= 0 && q.answer < 4 && q.explanation)
-        .map((q) => ({ subject, year: 0, question: q.question, options: q.options, answer: q.answer, explanation: q.explanation }));
-      await Question.insertMany(good);
-      saved += good.length;
-      console.log(`Saved ${saved} so far...`);
-    } catch (e) { console.log("Batch failed:", e.message); }
-  }
-  console.log(`Done. Added ${saved} questions to ${subject}. Please spot-check the answers.`);
-  process.exit();
+const validQ = (q) => q && q.question && Array.isArray(q.options) && q.options.length === 4 &&
+  Number.isInteger(q.answer) && q.answer >= 0 && q.answer < 4 && q.explanation;
+
+async function runJob(subjects, target) {
+  GEN.running = true; GEN.stop = false;
+  try {
+    for (const subject of subjects) {
+      if (GEN.stop) break;
+      const seen = new Set((await Question.find({ subject }).select("question")).map((q) => norm(q.question)));
+      let have = seen.size, t = 0, fails = 0;
+      say(subject + ": " + have + " questions now, target " + target);
+      let topics;
+      try {
+        topics = JSON.parse(await claude(`List 40 different topics from the JAMB UTME ${subject} syllabus. Reply with ONLY a JSON array of 40 short strings.`, 1500));
+      } catch (e) { say(subject + ": could not get the topic list (" + e.message + ")"); continue; }
+
+      while (have < target && !GEN.stop && fails < 8) {
+        const topic = topics[t++ % topics.length];
+        try {
+          const recent = (await Question.find({ subject }).sort({ _id: -1 }).limit(10).select("question")).map((q) => q.question);
+          const items = JSON.parse(await claude(
+            `Write 10 ORIGINAL multiple-choice practice questions for the JAMB UTME ${subject} syllabus on the topic "${topic}". ` +
+            `Vary the difficulty. Do not copy real past questions, and do not repeat or closely copy these existing questions: ${JSON.stringify(recent)}. ` +
+            `Each has exactly 4 options and exactly one correct answer, plus a short step-by-step solution ending with "Answer: <letter>". ` +
+            `Reply with ONLY a JSON array: [{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"..."}] where "answer" is the index (0-3) of the correct option.`));
+          const fresh = items.filter((q) => validQ(q) && !seen.has(norm(q.question)));
+          let good = [];
+          if (fresh.length) {
+            const flags = JSON.parse(await claude(
+              `Solve each multiple-choice question yourself. Reply with ONLY a JSON array of true or false, one per question: ` +
+              `true only if the marked answer index (0-3) is definitely correct and no other option is also correct.\n` +
+              JSON.stringify(fresh.map((q) => ({ question: q.question, options: q.options, answer: q.answer }))), 600));
+            good = fresh.filter((q, i) => flags[i] === true)
+              .map((q) => ({ subject, year: 0, question: q.question, options: q.options, answer: q.answer, explanation: q.explanation }));
+          }
+          if (good.length) {
+            await Question.insertMany(good);
+            good.forEach((q) => seen.add(norm(q.question)));
+            have += good.length; fails = 0;
+          } else fails++;
+          say(subject + " (" + topic + "): +" + good.length + " = " + have);
+        } catch (e) { fails++; say(subject + ": error, retrying (" + e.message + ")"); await pause(3000); }
+      }
+      say(subject + " finished with " + have + " questions");
+    }
+  } finally { GEN.running = false; say("Job ended"); }
 }
+
+app.post("/api/admin/generate", adminAuth, (req, res) => {
+  if (GEN.running) return res.status(409).json({ error: "A job is already running" });
+  if (!C.ANTHROPIC_API_KEY || C.ANTHROPIC_API_KEY === "placeholder") return res.status(400).json({ error: "ANTHROPIC_API_KEY is not set on Render" });
+  const subjects = req.body.subject === "ALL" ? Object.keys(BANK) : [req.body.subject];
+  runJob(subjects, Math.min(+req.body.target || 1000, 2000));
+  res.json({ started: true });
+});
+app.post("/api/admin/stop", adminAuth, (req, res) => { GEN.stop = true; res.json({ ok: true }); });
+app.get("/api/admin/status", adminAuth, async (req, res) => {
+  const counts = {};
+  for (const s of await Question.distinct("subject")) counts[s] = await Question.countDocuments({ subject: s });
+  res.json({ running: GEN.running, log: GEN.log.slice(-25), counts });
+});
+
+const GEN_HTML = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Question generator</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:0 auto;padding:16px}
+input,select,button{width:100%;padding:10px;margin:6px 0;font:inherit;box-sizing:border-box}
+button{background:#0b7a3e;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
+pre{background:#eee;color:#111;padding:10px;border-radius:8px;white-space:pre-wrap;font-size:13px}
+</style></head><body>
+<h2>Question generator</h2>
+<input id="key" type="password" placeholder="Admin key">
+<select id="sub"><option value="ALL">ALL subjects</option>${Object.keys(BANK).map((s) => `<option>${s}</option>`).join("")}</select>
+<input id="target" type="number" value="1000">
+<button id="go">Start generating</button>
+<button id="stop" style="background:#c0392b">Stop</button>
+<pre id="out">Enter your admin key, then press Start. Keep this page open while it runs.</pre>
+<script>
+function H(){return{"Content-Type":"application/json","x-admin-key":document.getElementById("key").value};}
+function show(t){document.getElementById("out").textContent=t;}
+async function post(url,body){var r=await fetch(url,{method:"POST",headers:H(),body:JSON.stringify(body||{})});return r.status===403?{error:"Wrong admin key."}:await r.json();}
+document.getElementById("go").onclick=async function(){var j=await post("/api/admin/generate",{subject:document.getElementById("sub").value,target:+document.getElementById("target").value});if(j.error)show(j.error);};
+document.getElementById("stop").onclick=async function(){await post("/api/admin/stop");};
+async function poll(){if(!document.getElementById("key").value)return;try{var r=await fetch("/api/admin/status",{headers:H()});if(r.status===403){show("Wrong admin key.");return;}var j=await r.json();var t=(j.running?"RUNNING":"IDLE")+"\\n\\nQuestions per subject:\\n";for(var k in j.counts)t+=k+": "+j.counts[k]+"\\n";t+="\\nLog:\\n"+j.log.join("\\n");show(t);}catch(e){}}
+setInterval(poll,5000);
+</script></body></html>`;
+app.get("/generate", (req, res) => res.type("html").send(GEN_HTML));
 
 /* ---------- The website itself (front-end) ---------- */
 const embed = (fn) => fn.toString().replace(/^[^]*?\/\*/, "").replace(/\*\/\s*\}\s*$/, "");
@@ -600,7 +667,7 @@ async function home() {
   <div class="card"><b>${status(user)}</b>
   ${subjects.length ? `
   <label><small>Subject</small><select id="sub">${subjects.map(s => `<option>${esc(s)}</option>`).join("")}</select></label>
-  <label><small>Number of questions</small><select id="n"><option>5</option><option>10</option><option>20</option><option>40</option></select></label>
+  <small>Free: 5 questions in total. After payment: 40 random questions in every exam.</small>
   <div class="err" id="er"></div><button id="go">Start exam</button>` : "<p>No questions in the database yet.</p>"}
   <div class="row"><button class="g" id="pl">Plans &amp; pricing</button><button class="g" id="hi">My scores</button></div></div>`;
   $("lo").onclick = e => { e.preventDefault(); logout(); };
@@ -612,7 +679,7 @@ async function home() {
 async function startExam() {
   const subject = $("sub").value;
   try {
-    const j = await api("/exam/start", "POST", { subject, count: $("n").value });
+    const j = await api("/exam/start", "POST", { subject });
     ex = { id: j.examId, qs: j.questions, i: 0, ans: {}, t: j.seconds, done: false };
     ex.timer = setInterval(() => { ex.t--; const e = $("tm"); if (e) e.textContent = fmt(ex.t); if (ex.t <= 0) submit(); }, 1000);
     show();
@@ -699,5 +766,4 @@ async function startServer() {
     app.listen(C.PORT, () => console.log("Test Dealer running on port " + C.PORT));
   } catch (e) { console.error("DB connection failed:", e.message); }
 }
-
-if (process.argv[2] === "generate") runGenerate(); else startServer();
+startServer();
