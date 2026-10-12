@@ -2,9 +2,9 @@
 /* ===================== TEST DEALER: ONE FILE ===================== */
 const C = {
   PORT: 3000,
-  MONGO_URI: "placeholder",
-  JWT_SECRET: "placeholder",
-  ADMIN_KEY: "placeholder",
+  MONGO_URI: "mongodb+srv://<test driller>:<driller2026pass>@cluster0.w3fb0az.mongodb.net/?appName=Cluster0",
+  JWT_SECRET: "k8Tq2mZx9Lp4Wv7Rb3Nc6Yd1Hs5Jf",
+  ADMIN_KEY: "Hy7Bn3Qa9Ze5Ku2Wd8Lc",
   PAYSTACK_SECRET_KEY: "placeholder",
   BASE_URL: "http://localhost:3000",
   FREE_LIMIT: 5,
