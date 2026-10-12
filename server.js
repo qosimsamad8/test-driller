@@ -11,9 +11,9 @@ const C = {
   SMTP_HOST: "smtp.gmail.com",
   SMTP_PORT: 587,
   SMTP_USER: "qosimsamad8@gmail.com",
-  SMTP_PASS: "12a3#4b5",
-  MAIL_FROM: "Test driller <myapp@example.com>",
-  ANTHROPIC_API_KEY: "12a3#4b56c7d",
+  SMTP_PASS: "dfretwqyujhklioz",
+  MAIL_FROM: "Test driller <https://test-driller-7.onrender.com>",
+  ANTHROPIC_API_KEY: "",
 };
 for (const k in C) if (process.env[k]) C[k] = process.env[k]; // Render's Environment values override the above
 
