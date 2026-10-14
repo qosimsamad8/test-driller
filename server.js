@@ -12,7 +12,7 @@ const C = {
   SMTP_PORT: 587,
   SMTP_USER: "qosimsamad8@gmail.com",
   SMTP_PASS: "qeavyhhsgxltsydm",
-  MAIL_FROM: "Testdriller <https://test-driller-7.onrender.com>",
+  MAIL_FROM: "Testdriller  <placeholder@example.com>",
   ANTHROPIC_API_KEY: "sk-ant-api03",
 };
 for (const k in C) if (process.env[k]) C[k] = process.env[k]; // Render's Environment values override the above
