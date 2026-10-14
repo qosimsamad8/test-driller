@@ -10,10 +10,10 @@ const C = {
   FREE_LIMIT: 5,
   SMTP_HOST: "smtp.gmail.com",
   SMTP_PORT: 587,
-  SMTP_USER: "qosimsamad8@gmail.com",
-  SMTP_PASS: "qeavyhhsgxltsydm",
+  SMTP_USER: "placeholder",
+  SMTP_PASS: "placeholder",
   MAIL_FROM: "Testdriller  <placeholder@example.com>",
-  ANTHROPIC_API_KEY: "sk-ant-api03",
+  ANTHROPIC_API_KEY: "placeholder",
 };
 for (const k in C) if (process.env[k]) C[k] = process.env[k]; // Render's Environment values override the above
 
