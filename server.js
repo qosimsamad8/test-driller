@@ -11,7 +11,7 @@ const C = {
   SMTP_HOST: "smtp.gmail.com",
   SMTP_PORT: 587,
   SMTP_USER: "qosimsamad8@gmail.com",
-  SMTP_PASS: ""dfretwqyujhkli oz",
+  SMTP_PASS: ""qeav yhhs gxlt sydm",
   MAIL_FROM: "Test driller <https://test-driller-7.onrender.com>",
   ANTHROPIC_API_KEY: "sk-ant-api03",
 };
