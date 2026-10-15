@@ -1,5 +1,5 @@
-/* ===================== TEST DEALER: ONE FILE ===================== */
-/* Nothing private is written in this file. Secrets come from Render's Environment page. */
+/* ===================== TEST DEALER: ONE FILE (no setup needed) ===================== */
+/* It works the moment it is on Render. Optional settings can be added later on Render's Environment page. */
 const C = {
   PORT: 3000,
   MONGO_URI: "",
@@ -19,16 +19,17 @@ for (const k in C) if (process.env[k] && process.env[k].trim()) C[k] = process.e
 if (!C.BASE_URL) C.BASE_URL = process.env.RENDER_EXTERNAL_URL || "http://localhost:" + C.PORT;
 const real = (v) => !!v && String(v).trim() !== "" && String(v).trim() !== "placeholder";
 
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
-const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const nodemailer = require("nodemailer");
-const { Schema } = mongoose;
 
 process.on("unhandledRejection", (e) => console.error("Unhandled problem:", e && e.message ? e.message : e));
 process.on("uncaughtException", (e) => console.error("Uncaught problem:", e && e.message ? e.message : e));
@@ -165,66 +166,70 @@ const BANK = {
 const STARTER = Object.entries(BANK).flatMap(([subject, list]) =>
   list.map(([question, options, answer, explanation]) => ({ subject, year: 0, question, options, answer, explanation })));
 
-/* ---------- Database models ---------- */
-const Setting = mongoose.model("Setting", new Schema({ key: { type: String, unique: true }, value: String }));
+/* ======================= DATA LAYER (starts here) =======================
+   Everything is kept in memory and saved to a file (preview mode)
+   or to MongoDB (permanent mode, only when MONGO_URI is set). */
+const DB = { users: [], questions: [], exams: [], payments: [], settings: [] };
+const IDX = { userById: new Map(), userByEmail: new Map(), qById: new Map(), qBySubject: new Map(), examById: new Map(), seenBy: new Map(), payByRef: new Map(), setting: new Map() };
+const newId = () => crypto.randomBytes(12).toString("hex");
 
-const User = mongoose.model("User", new Schema({
-  name: String,
-  email: { type: String, unique: true, lowercase: true, required: true },
-  password: { type: String, required: true },
-  used: { type: Number, default: 0 },
-  allUntil: Date,
-  subjects: [{ name: String, until: Date, _id: false }],
-  resetHash: String,
-  resetExpires: Date,
-}, { timestamps: true }));
-
-const Question = mongoose.model("Question", new Schema({
-  subject: { type: String, index: true },
-  year: { type: Number, default: 0 },
-  question: String,
-  options: [String],
-  answer: Number,
-  explanation: String,
-}));
-
-const Exam = mongoose.model("Exam", new Schema({
-  user: { type: Schema.Types.ObjectId, ref: "User", index: true },
-  subject: String,
-  total: Number,
-  questions: [{ type: Schema.Types.ObjectId, ref: "Question" }],
-  submitted: { type: Boolean, default: false },
-  score: Number,
-}, { timestamps: true }));
-
-const Payment = mongoose.model("Payment", new Schema({
-  reference: { type: String, unique: true },
-  user: { type: Schema.Types.ObjectId, ref: "User" },
-  plan: String, subject: String, amount: Number,
-}, { timestamps: true }));
-
-/* ---------- Database connection that explains its own problems ---------- */
-let dbReady = false;
-let dbError = "Starting up...";
-let JWT_KEY = real(C.JWT_SECRET) ? C.JWT_SECRET : "";
-
-function stripUri(raw) {
-  return String(raw || "").trim().replace(/^MONGO_URI\s*=\s*/i, "").replace(/^["']+|["']+$/g, "").trim();
+function indexUser(u) { IDX.userById.set(u._id, u); IDX.userByEmail.set(u.email, u); }
+function indexQuestion(q) {
+  IDX.qById.set(q._id, q);
+  if (!IDX.qBySubject.has(q.subject)) IDX.qBySubject.set(q.subject, []);
+  IDX.qBySubject.get(q.subject).push(q);
 }
-function uriProblem(s) {
-  if (!real(s)) return "No MONGO_URI was found. On Render open your service, click Environment, click Add Environment Variable, type MONGO_URI in the Key box and paste your MongoDB link in the Value box.";
-  if (!/^mongodb(\+srv)?:\/\//.test(s)) return "MONGO_URI must start with mongodb+srv:// . Copy the link again from MongoDB: Database, Connect, Drivers.";
-  if (/[<>]/.test(s)) return "MONGO_URI still contains the signs < or >. Replace <db_password> (including the signs) with your real database password.";
+function indexExam(e) {
+  IDX.examById.set(e._id, e);
+  let s = IDX.seenBy.get(e.user);
+  if (!s) { s = new Set(); IDX.seenBy.set(e.user, s); }
+  e.questions.forEach((id) => s.add(id));
+}
+function reindex() {
+  for (const m of Object.values(IDX)) m.clear();
+  DB.users.forEach(indexUser);
+  DB.questions.forEach(indexQuestion);
+  DB.exams.forEach(indexExam);
+  DB.payments.forEach((p) => IDX.payByRef.set(p._id, p));
+  DB.settings.forEach((s) => IDX.setting.set(s._id, s.value));
+}
+
+const PERSIST = { mode: "file", dir: "", db: null, dirty: new Set(), timer: null };
+function dataDir() {
+  const tries = [process.env.DATA_DIR, path.join(__dirname, "data"), path.join(os.tmpdir(), "testdealer-data")].filter(Boolean);
+  for (const d of tries) {
+    try { fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch (e) { /* try the next folder */ }
+  }
   return "";
 }
-function fixUri(s) {
-  const m = s.match(/^(mongodb(?:\+srv)?:\/\/)([^:\/@]+):(.+)@([^@]+)$/);
-  if (!m) return s;
-  const dec = (x) => { try { return decodeURIComponent(x); } catch (e) { return x; } };
-  const rest = m[4].match(/^([^\/?]+)(?:\/([^?]*))?(\?.*)?$/);
-  if (!rest) return s;
-  return m[1] + encodeURIComponent(dec(m[2])) + ":" + encodeURIComponent(dec(m[3])) + "@" + rest[1] + "/" + (rest[2] || "testdealer") + (rest[3] || "");
+async function persistInit(uri) {
+  if (uri) {
+    const { MongoClient } = require("mongoose").mongo;
+    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 20000 });
+    try {
+      await client.connect();
+      const db = client.db();
+      await db.command({ ping: 1 });
+      for (const c of Object.keys(DB)) DB[c] = await db.collection("td_" + c).find({}).toArray();
+      PERSIST.db = db; PERSIST.mode = "mongo";
+    } catch (e) { try { await client.close(); } catch (x) { /* ignore */ } throw e; }
+  } else {
+    PERSIST.mode = "file"; PERSIST.dir = dataDir();
+    for (const c of Object.keys(DB)) {
+      try { DB[c] = JSON.parse(fs.readFileSync(path.join(PERSIST.dir, c + ".json"), "utf8")); } catch (e) { DB[c] = []; }
+    }
+  }
 }
-function explain(e) {
-  const t = String((e && e.message) || e);
-  if (/bad auth|Authentication failed/i.test(t)) return "MongoDB refused the username or password in your MONGO_URI. In MongoDB open Database Access, click Edit on your user, set a NEW password using only letters an
+function flush() {
+  PERSIST.timer = null;
+  if (!PERSIST.dir) return;
+  for (const c of [...PERSIST.dirty]) {
+    PERSIST.dirty.delete(c);
+    try {
+      const f = path.join(PERSIST.dir, c + ".json");
+      fs.writeFileSync(f + ".tmp", JSON.stringify(DB[c]));
+      fs.renameSync(f + ".tmp", f);
+    } catch (e) { console.error("Could not save " + c + ":", e.message); }
+  }
+}
+function later
