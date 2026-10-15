@@ -1,21 +1,23 @@
-
 /* ===================== TEST DEALER: ONE FILE ===================== */
+/* Nothing private is written in this file. Secrets come from Render's Environment page. */
 const C = {
   PORT: 3000,
-  MONGO_URI: "mongodb+srv://<test driller>:<driller2026pass>@cluster0.w3fb0az.mongodb.net/?appName=Cluster0",
-  JWT_SECRET: "k8Tq2mZx9Lp4Wv7Rb3Nc6Yd1Hs5Jf",
-  ADMIN_KEY: "Hy7Bn3Qa9Ze5Ku2Wd8Lc",
-  PAYSTACK_SECRET_KEY: "placeholder",
-  BASE_URL: "http://localhost:3000",
+  MONGO_URI: "",
+  JWT_SECRET: "",
+  ADMIN_KEY: "",
+  PAYSTACK_SECRET_KEY: "",
+  BASE_URL: "",
   FREE_LIMIT: 5,
   SMTP_HOST: "smtp.gmail.com",
   SMTP_PORT: 587,
-  SMTP_USER: "placeholder",
-  SMTP_PASS: "placeholder",
-  MAIL_FROM: "Testdriller  <placeholder@example.com>",
-  ANTHROPIC_API_KEY: "placeholder",
+  SMTP_USER: "",
+  SMTP_PASS: "",
+  MAIL_FROM: "",
+  ANTHROPIC_API_KEY: "",
 };
-for (const k in C) if (process.env[k]) C[k] = process.env[k]; // Render's Environment values override the above
+for (const k in C) if (process.env[k] && process.env[k].trim()) C[k] = process.env[k].trim();
+if (!C.BASE_URL) C.BASE_URL = process.env.RENDER_EXTERNAL_URL || "http://localhost:" + C.PORT;
+const real = (v) => !!v && String(v).trim() !== "" && String(v).trim() !== "placeholder";
 
 const crypto = require("crypto");
 const express = require("express");
@@ -27,6 +29,9 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const nodemailer = require("nodemailer");
 const { Schema } = mongoose;
+
+process.on("unhandledRejection", (e) => console.error("Unhandled problem:", e && e.message ? e.message : e));
+process.on("uncaughtException", (e) => console.error("Uncaught problem:", e && e.message ? e.message : e));
 
 /* ---------- Starter questions: [question, [options], correctIndex (from 0), solution] ---------- */
 const BANK = {
@@ -161,6 +166,8 @@ const STARTER = Object.entries(BANK).flatMap(([subject, list]) =>
   list.map(([question, options, answer, explanation]) => ({ subject, year: 0, question, options, answer, explanation })));
 
 /* ---------- Database models ---------- */
+const Setting = mongoose.model("Setting", new Schema({ key: { type: String, unique: true }, value: String }));
+
 const User = mongoose.model("User", new Schema({
   name: String,
   email: { type: String, unique: true, lowercase: true, required: true },
@@ -196,574 +203,28 @@ const Payment = mongoose.model("Payment", new Schema({
   plan: String, subject: String, amount: Number,
 }, { timestamps: true }));
 
-/* ---------- Settings & helpers ---------- */
-const app = express();
-app.set("trust proxy", 1);
-const FREE = +C.FREE_LIMIT || 5;
-const DAY = 86400000;
-const PS = "https://api.paystack.co";
-const psHeaders = () => ({ Authorization: `Bearer ${C.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" });
+/* ---------- Database connection that explains its own problems ---------- */
+let dbReady = false;
+let dbError = "Starting up...";
+let JWT_KEY = real(C.JWT_SECRET) ? C.JWT_SECRET : "";
 
-// Change these prices and durations whenever you like
-const PLANS = {
-  subject: { label: "One subject (30 days)", naira: 1500, days: 30 },
-  monthly: { label: "All subjects (30 days)", naira: 3000, days: 30 },
-  full:    { label: "All subjects (lifetime)", naira: 10000, days: 36500 },
-};
-
-app.use(cors());
-app.use(helmet({ contentSecurityPolicy: false }));
-
-async function fulfil(d) {
-  const m = d.metadata || {};
-  const plan = PLANS[m.plan];
-  if (!plan || !m.userId || d.status !== "success" || d.amount < plan.naira * 100) return false;
-  if (m.plan === "subject" && !m.subject) return false;
-  try {
-    await Payment.create({ reference: d.reference, user: m.userId, plan: m.plan, subject: m.subject, amount: d.amount });
-  } catch (e) {
-    if (e.code !== 11000) throw e;
-    return true;
-  }
-  const u = await User.findById(m.userId);
-  if (!u) return false;
-  const now = Date.now();
-  if (m.plan === "subject") {
-    const cur = u.subjects.find((s) => s.name === m.subject);
-    const base = cur && cur.until > now ? +cur.until : now;
-    const until = new Date(base + plan.days * DAY);
-    if (cur) cur.until = until; else u.subjects.push({ name: m.subject, until });
-  } else {
-    const base = u.allUntil && u.allUntil > now ? +u.allUntil : now;
-    u.allUntil = new Date(base + plan.days * DAY);
-  }
-  await u.save();
-  return true;
+function stripUri(raw) {
+  return String(raw || "").trim().replace(/^MONGO_URI\s*=\s*/i, "").replace(/^["']+|["']+$/g, "").trim();
 }
-
-app.post("/api/pay/webhook", express.raw({ type: "*/*" }), async (req, res) => {
-  const hash = crypto.createHmac("sha512", C.PAYSTACK_SECRET_KEY).update(req.body).digest("hex");
-  if (hash !== req.headers["x-paystack-signature"]) return res.sendStatus(401);
-  const event = JSON.parse(req.body.toString());
-  if (event.event === "charge.success") await fulfil(event.data);
-  res.sendStatus(200);
-});
-
-app.use(express.json({ limit: "5mb" }));
-app.use("/api/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }));
-app.use("/api/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }));
-app.use("/api/forgot", rateLimit({ windowMs: 60 * 60 * 1000, max: 10 }));
-
-const sign = (u) => jwt.sign({ id: u._id }, C.JWT_SECRET, { expiresIn: "30d" });
-async function auth(req, res, next) {
-  try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "");
-    const { id } = jwt.verify(token, C.JWT_SECRET);
-    req.user = await User.findById(id);
-    if (!req.user) throw new Error();
-    next();
-  } catch { res.status(401).json({ error: "Please log in" }); }
+function uriProblem(s) {
+  if (!real(s)) return "No MONGO_URI was found. On Render open your service, click Environment, click Add Environment Variable, type MONGO_URI in the Key box and paste your MongoDB link in the Value box.";
+  if (!/^mongodb(\+srv)?:\/\//.test(s)) return "MONGO_URI must start with mongodb+srv:// . Copy the link again from MongoDB: Database, Connect, Drivers.";
+  if (/[<>]/.test(s)) return "MONGO_URI still contains the signs < or >. Replace <db_password> (including the signs) with your real database password.";
+  return "";
 }
-const hasAccess = (u, subject) => {
-  const now = Date.now();
-  if (u.allUntil && u.allUntil > now) return true;
-  return u.subjects.some((s) => s.name === subject && s.until > now);
-};
-const freeLeft = (u) => Math.max(0, FREE - u.used);
-const publicUser = (u) => {
-  const now = Date.now();
-  return {
-    name: u.name, email: u.email, left: freeLeft(u),
-    allUntil: u.allUntil && u.allUntil > now ? u.allUntil : null,
-    subjects: u.subjects.filter((s) => s.until > now).map((s) => ({ name: s.name, until: s.until })),
-  };
-};
-
-/* ---------- Login, signup, password reset ---------- */
-app.post("/api/signup", async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!email || !password || password.length < 6) return res.status(400).json({ error: "Email and a password of 6+ characters required" });
-  if (await User.findOne({ email: email.toLowerCase() })) return res.status(409).json({ error: "Email already registered" });
-  const u = await User.create({ name, email, password: await bcrypt.hash(password, 10) });
-  res.json({ token: sign(u), user: publicUser(u) });
-});
-
-app.post("/api/login", async (req, res) => {
-  const u = await User.findOne({ email: (req.body.email || "").toLowerCase() });
-  if (!u || !(await bcrypt.compare(req.body.password || "", u.password))) return res.status(401).json({ error: "Wrong email or password" });
-  res.json({ token: sign(u), user: publicUser(u) });
-});
-
-app.get("/api/me", auth, (req, res) => res.json(publicUser(req.user)));
-
-const mailer = nodemailer.createTransport({
-  host: C.SMTP_HOST, port: +C.SMTP_PORT || 587, secure: +C.SMTP_PORT === 465,
-  auth: { user: C.SMTP_USER, pass: C.SMTP_PASS },
-});
-
-app.post("/api/forgot", async (req, res) => {
-  res.json({ ok: true });
-  try {
-    const u = await User.findOne({ email: (req.body.email || "").toLowerCase() });
-    if (!u) return;
-    const token = crypto.randomBytes(32).toString("hex");
-    u.resetHash = crypto.createHash("sha256").update(token).digest("hex");
-    u.resetExpires = new Date(Date.now() + 3600000);
-    await u.save();
-    await mailer.sendMail({
-      from: C.MAIL_FROM, to: u.email, subject: "Reset your Test Dealer password",
-      text: `Open this link to set a new password (valid for 1 hour):\n${C.BASE_URL}/?reset=${token}\n\nIf you did not ask for this, ignore this email.`,
-    });
-  } catch (e) { console.error("Reset email failed:", e.message); }
-});
-
-app.post("/api/reset", async (req, res) => {
-  const { token, password } = req.body;
-  if (!token || !password || password.length < 6) return res.status(400).json({ error: "Password of 6+ characters required" });
-  const hash = crypto.createHash("sha256").update(token).digest("hex");
-  const u = await User.findOne({ resetHash: hash, resetExpires: { $gt: new Date() } });
-  if (!u) return res.status(400).json({ error: "This reset link is invalid or has expired" });
-  u.password = await bcrypt.hash(password, 10);
-  u.resetHash = undefined; u.resetExpires = undefined;
-  await u.save();
-  res.json({ token: sign(u), user: publicUser(u) });
-});
-
-/* ---------- Subjects, exams, score history ---------- */
-app.get("/api/subjects", async (req, res) => res.json(await Question.distinct("subject")));
-app.get("/api/plans", (req, res) => res.json(PLANS));
-
-// Free users: 5 questions in total. Paid users: 40 random questions per exam, avoiding ones they have already seen.
-app.post("/api/exam/start", auth, async (req, res) => {
-  const { subject } = req.body;
-  const unlimited = hasAccess(req.user, subject);
-  const left = freeLeft(req.user);
-  if (!unlimited && left === 0) return res.status(402).json({ error: "Your free questions are finished. Please choose a plan to continue." });
-
-  const n = unlimited ? 40 : Math.min(5, left);
-  const seen = await Exam.distinct("questions", { user: req.user._id });
-  let qs = await Question.aggregate([{ $match: { subject, _id: { $nin: seen } } }, { $sample: { size: n } }]);
-  if (qs.length < n) {
-    const more = await Question.aggregate([{ $match: { subject, _id: { $nin: qs.map((q) => q._id) } } }, { $sample: { size: n - qs.length } }]);
-    qs = qs.concat(more);
-  }
-  if (!qs.length) return res.status(404).json({ error: "No questions found for that subject" });
-
-  if (!unlimited) { req.user.used += qs.length; await req.user.save(); }
-
-  const exam = await Exam.create({ user: req.user._id, subject, total: qs.length, questions: qs.map((q) => q._id) });
-  res.json({
-    examId: exam._id,
-    seconds: qs.length * 90,
-    questions: qs.map((q) => ({ id: q._id, subject: q.subject, question: q.question, options: q.options })),
-    user: publicUser(req.user),
-  });
-});
-
-app.post("/api/exam/submit", auth, async (req, res) => {
-  const exam = await Exam.findOne({ _id: req.body.examId, user: req.user._id }).populate("questions");
-  if (!exam) return res.status(404).json({ error: "Exam not found" });
-  if (exam.submitted) return res.status(400).json({ error: "Already submitted" });
-  const answers = req.body.answers || {};
-  let score = 0;
-  const review = exam.questions.map((q) => {
-    const picked = answers[q._id];
-    if (picked === q.answer) score++;
-    return { id: q._id, question: q.question, options: q.options, correct: q.answer, picked, explanation: q.explanation || "" };
-  });
-  exam.submitted = true; exam.score = score; await exam.save();
-  res.json({ score, total: review.length, review, user: publicUser(req.user) });
-});
-
-app.get("/api/history", auth, async (req, res) => {
-  res.json(await Exam.find({ user: req.user._id, submitted: true })
-    .sort({ createdAt: -1 }).limit(50).select("subject score total createdAt"));
-});
-
-/* ---------- Payment (Paystack) ---------- */
-app.post("/api/pay/init", auth, async (req, res) => {
-  const { plan, subject } = req.body;
-  const p = PLANS[plan];
-  if (!p) return res.status(400).json({ error: "Unknown plan" });
-  if (plan === "subject" && !subject) return res.status(400).json({ error: "Choose a subject" });
-  const r = await fetch(`${PS}/transaction/initialize`, {
-    method: "POST", headers: psHeaders(),
-    body: JSON.stringify({
-      email: req.user.email, amount: p.naira * 100,
-      callback_url: `${C.BASE_URL}/`,
-      metadata: { userId: String(req.user._id), plan, subject },
-    }),
-  });
-  const j = await r.json();
-  if (!j.status) return res.status(502).json({ error: j.message || "Could not start payment" });
-  res.json({ url: j.data.authorization_url });
-});
-
-app.get("/api/pay/verify", auth, async (req, res) => {
-  const r = await fetch(`${PS}/transaction/verify/${encodeURIComponent(req.query.reference)}`, { headers: psHeaders() });
-  const j = await r.json();
-  if (j.status && j.data && j.data.metadata && j.data.metadata.userId === String(req.user._id)) {
-    await fulfil(j.data);
-    req.user = await User.findById(req.user._id);
-  }
-  res.json(publicUser(req.user));
-});
-
-/* ---------- Admin: upload page at /admin ---------- */
-const ADMIN_HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Test Dealer Admin</title>
-<style>
-body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:0 auto;padding:16px}
-textarea,input,button{width:100%;padding:10px;margin:6px 0;font:inherit;box-sizing:border-box}
-textarea{height:320px;font-family:monospace}
-button{background:#0b7a3e;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
-pre{background:#eee;color:#111;padding:10px;border-radius:8px;white-space:pre-wrap}
-</style></head><body>
-<h2>Test Dealer Admin</h2>
-<input id="key" type="password" placeholder="Admin key">
-<textarea id="js" placeholder='Paste a JSON array: [{"subject":"Physics","question":"...","options":["A","B","C","D"],"answer":2,"explanation":"..."}]'></textarea>
-<button id="go">Upload questions</button>
-<pre id="out"></pre>
-<script>
-document.getElementById("go").onclick = async function () {
-  var out = document.getElementById("out");
-  var data;
-  try { data = JSON.parse(document.getElementById("js").value); }
-  catch (e) { out.textContent = "That is not valid JSON."; return; }
-  var r = await fetch("/api/admin/questions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-admin-key": document.getElementById("key").value },
-    body: JSON.stringify(data)
-  });
-  out.textContent = r.status === 403 ? "Wrong admin key." : JSON.stringify(await r.json(), null, 2);
-};
-</script></body></html>`;
-app.get("/admin", (req, res) => res.type("html").send(ADMIN_HTML));
-
-const adminAuth = (req, res, next) =>
-  C.ADMIN_KEY && req.headers["x-admin-key"] === C.ADMIN_KEY ? next() : res.sendStatus(403);
-
-app.post("/api/admin/questions", adminAuth, async (req, res) => {
-  const list = Array.isArray(req.body) ? req.body : [req.body];
-  const good = [], bad = [];
-  list.forEach((q, i) => {
-    const y = q && q.year == null ? 0 : +(q && q.year);
-    const ok = q && q.subject && (y === 0 || (y >= 1990 && y <= 2026)) &&
-      q.question && Array.isArray(q.options) && q.options.length >= 2 &&
-      Number.isInteger(q.answer) && q.answer >= 0 && q.answer < q.options.length;
-    ok ? good.push({ subject: q.subject.trim(), year: y, question: q.question, options: q.options, answer: q.answer, explanation: q.explanation || "" })
-       : bad.push(i + 1);
-  });
-  if (good.length) await Question.insertMany(good);
-  res.json({ added: good.length, rejected_item_numbers: bad });
-});
-
-/* ---------- Bulk question generator (open /generate) ---------- */
-const GEN = { running: false, stop: false, log: [] };
-const say = (m) => { GEN.log.push(new Date().toLocaleTimeString() + "  " + m); if (GEN.log.length > 100) GEN.log.shift(); console.log(m); };
-const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
-const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function claude(prompt, max = 4000) {
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": C.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-5-5", max_tokens: max, messages: [{ role: "user", content: prompt }] }),
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
-  return j.content.map((c) => c.text || "").join("").replace(/```json|```/g, "").trim();
+function fixUri(s) {
+  const m = s.match(/^(mongodb(?:\+srv)?:\/\/)([^:\/@]+):(.+)@([^@]+)$/);
+  if (!m) return s;
+  const dec = (x) => { try { return decodeURIComponent(x); } catch (e) { return x; } };
+  const rest = m[4].match(/^([^\/?]+)(?:\/([^?]*))?(\?.*)?$/);
+  if (!rest) return s;
+  return m[1] + encodeURIComponent(dec(m[2])) + ":" + encodeURIComponent(dec(m[3])) + "@" + rest[1] + "/" + (rest[2] || "testdealer") + (rest[3] || "");
 }
-
-const validQ = (q) => q && q.question && Array.isArray(q.options) && q.options.length === 4 &&
-  Number.isInteger(q.answer) && q.answer >= 0 && q.answer < 4 && q.explanation;
-
-async function runJob(subjects, target) {
-  GEN.running = true; GEN.stop = false;
-  try {
-    for (const subject of subjects) {
-      if (GEN.stop) break;
-      const seen = new Set((await Question.find({ subject }).select("question")).map((q) => norm(q.question)));
-      let have = seen.size, t = 0, fails = 0;
-      say(subject + ": " + have + " questions now, target " + target);
-      let topics;
-      try {
-        topics = JSON.parse(await claude(`List 40 different topics from the JAMB UTME ${subject} syllabus. Reply with ONLY a JSON array of 40 short strings.`, 1500));
-      } catch (e) { say(subject + ": could not get the topic list (" + e.message + ")"); continue; }
-
-      while (have < target && !GEN.stop && fails < 8) {
-        const topic = topics[t++ % topics.length];
-        try {
-          const recent = (await Question.find({ subject }).sort({ _id: -1 }).limit(10).select("question")).map((q) => q.question);
-          const items = JSON.parse(await claude(
-            `Write 10 ORIGINAL multiple-choice practice questions for the JAMB UTME ${subject} syllabus on the topic "${topic}". ` +
-            `Vary the difficulty. Do not copy real past questions, and do not repeat or closely copy these existing questions: ${JSON.stringify(recent)}. ` +
-            `Each has exactly 4 options and exactly one correct answer, plus a short step-by-step solution ending with "Answer: <letter>". ` +
-            `Reply with ONLY a JSON array: [{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"..."}] where "answer" is the index (0-3) of the correct option.`));
-          const fresh = items.filter((q) => validQ(q) && !seen.has(norm(q.question)));
-          let good = [];
-          if (fresh.length) {
-            const flags = JSON.parse(await claude(
-              `Solve each multiple-choice question yourself. Reply with ONLY a JSON array of true or false, one per question: ` +
-              `true only if the marked answer index (0-3) is definitely correct and no other option is also correct.\n` +
-              JSON.stringify(fresh.map((q) => ({ question: q.question, options: q.options, answer: q.answer }))), 600));
-            good = fresh.filter((q, i) => flags[i] === true)
-              .map((q) => ({ subject, year: 0, question: q.question, options: q.options, answer: q.answer, explanation: q.explanation }));
-          }
-          if (good.length) {
-            await Question.insertMany(good);
-            good.forEach((q) => seen.add(norm(q.question)));
-            have += good.length; fails = 0;
-          } else fails++;
-          say(subject + " (" + topic + "): +" + good.length + " = " + have);
-        } catch (e) { fails++; say(subject + ": error, retrying (" + e.message + ")"); await pause(3000); }
-      }
-      say(subject + " finished with " + have + " questions");
-    }
-  } finally { GEN.running = false; say("Job ended"); }
-}
-
-app.post("/api/admin/generate", adminAuth, (req, res) => {
-  if (GEN.running) return res.status(409).json({ error: "A job is already running" });
-  if (!C.ANTHROPIC_API_KEY || C.ANTHROPIC_API_KEY === "placeholder") return res.status(400).json({ error: "ANTHROPIC_API_KEY is not set on Render" });
-  const subjects = req.body.subject === "ALL" ? Object.keys(BANK) : [req.body.subject];
-  runJob(subjects, Math.min(+req.body.target || 1000, 2000));
-  res.json({ started: true });
-});
-app.post("/api/admin/stop", adminAuth, (req, res) => { GEN.stop = true; res.json({ ok: true }); });
-app.get("/api/admin/status", adminAuth, async (req, res) => {
-  const counts = {};
-  for (const s of await Question.distinct("subject")) counts[s] = await Question.countDocuments({ subject: s });
-  res.json({ running: GEN.running, log: GEN.log.slice(-25), counts });
-});
-
-const GEN_HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Question generator</title>
-<style>
-body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:0 auto;padding:16px}
-input,select,button{width:100%;padding:10px;margin:6px 0;font:inherit;box-sizing:border-box}
-button{background:#0b7a3e;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
-pre{background:#eee;color:#111;padding:10px;border-radius:8px;white-space:pre-wrap;font-size:13px}
-</style></head><body>
-<h2>Question generator</h2>
-<input id="key" type="password" placeholder="Admin key">
-<select id="sub"><option value="ALL">ALL subjects</option>${Object.keys(BANK).map((s) => `<option>${s}</option>`).join("")}</select>
-<input id="target" type="number" value="1000">
-<button id="go">Start generating</button>
-<button id="stop" style="background:#c0392b">Stop</button>
-<pre id="out">Enter your admin key, then press Start. Keep this page open while it runs.</pre>
-<script>
-function H(){return{"Content-Type":"application/json","x-admin-key":document.getElementById("key").value};}
-function show(t){document.getElementById("out").textContent=t;}
-async function post(url,body){var r=await fetch(url,{method:"POST",headers:H(),body:JSON.stringify(body||{})});return r.status===403?{error:"Wrong admin key."}:await r.json();}
-document.getElementById("go").onclick=async function(){var j=await post("/api/admin/generate",{subject:document.getElementById("sub").value,target:+document.getElementById("target").value});if(j.error)show(j.error);};
-document.getElementById("stop").onclick=async function(){await post("/api/admin/stop");};
-async function poll(){if(!document.getElementById("key").value)return;try{var r=await fetch("/api/admin/status",{headers:H()});if(r.status===403){show("Wrong admin key.");return;}var j=await r.json();var t=(j.running?"RUNNING":"IDLE")+"\\n\\nQuestions per subject:\\n";for(var k in j.counts)t+=k+": "+j.counts[k]+"\\n";t+="\\nLog:\\n"+j.log.join("\\n");show(t);}catch(e){}}
-setInterval(poll,5000);
-</script></body></html>`;
-app.get("/generate", (req, res) => res.type("html").send(GEN_HTML));
-
-/* ---------- The website itself (front-end) ---------- */
-const embed = (fn) => fn.toString().replace(/^[^]*?\/\*/, "").replace(/\*\/\s*\}\s*$/, "");
-const PAGE = embed(function () {/*<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Test Dealer</title>
-<style>
-:root{--bg:#f5f7f4;--card:#fff;--tx:#14231a;--mut:#5b6b60;--pri:#0b7a3e;--bd:#d8e0da;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1712;--card:#18231c;--tx:#e8f1ea;--mut:#9db0a3;--bd:#2a3b2f;--pri:#2ecc71}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,Segoe UI,Arial,sans-serif}
-.w{max-width:680px;margin:0 auto;padding:16px}
-h1{margin:0;color:var(--pri)}.sub{color:var(--mut);margin:4px 0 16px}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:12px}
-select,input,button{font:inherit;padding:10px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--tx);width:100%;margin:6px 0}
-button{background:var(--pri);color:#fff;border:0;cursor:pointer;font-weight:600}
-button:disabled{opacity:.5}
-button.g{background:transparent;color:var(--tx);border:1px solid var(--bd)}
-.opt{display:block;text-align:left;background:var(--card);color:var(--tx);border:1px solid var(--bd);font-weight:400}
-.opt.sel{border-color:var(--pri);outline:2px solid var(--pri)}
-.ans{padding:8px;border-radius:8px;margin:4px 0;border:1px solid var(--bd)}
-.ans.ok{background:#d4f5e0;color:#0a3d1f}.ans.no{background:#fadbd8;color:#5c1a12}
-.sol{margin-top:8px;padding:10px;border-left:4px solid var(--pri);background:rgba(11,122,62,.08);white-space:pre-wrap;border-radius:4px}
-.row{display:flex;gap:8px}.row>*{flex:1}
-.bar{display:flex;justify-content:space-between;color:var(--mut);font-size:14px;margin-bottom:8px}
-.err{color:#c0392b;min-height:1.2em}.okm{color:var(--pri)}
-.price{font-size:22px;font-weight:700;color:var(--pri)}
-a{color:var(--pri)}small{color:var(--mut)}
-</style></head><body><div class="w" id="app"></div>
-<script>
-const $ = id => document.getElementById(id), app = $("app");
-const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const fmt = t => Math.floor(t/60) + ":" + String(t%60).padStart(2,"0");
-const dt = s => new Date(s).toLocaleDateString();
-let token = localStorage.getItem("td_token") || "";
-let user = null, ex = null;
-
-async function api(path, method = "GET", body) {
-  const r = await fetch("/api" + path, {
-    method,
-    headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && token) logout();
-  if (!r.ok) throw Object.assign(new Error(j.error || "Something went wrong"), { status: r.status });
-  return j;
-}
-function logout() { token = ""; user = null; localStorage.removeItem("td_token"); authScreen(); }
-function setSession(j) { token = j.token; user = j.user; localStorage.setItem("td_token", token); }
-
-// ---------- Login / Signup / Forgot ----------
-function authScreen(mode = "login") {
-  const su = mode === "signup", fg = mode === "forgot";
-  app.innerHTML = `<h1>Test Dealer</h1><p class="sub">JAMB CBT practice for all subjects</p>
-  <div class="card"><h3>${fg ? "Reset password" : su ? "Create account" : "Log in"}</h3>
-  ${su ? '<input id="nm" placeholder="Full name">' : ""}
-  <input id="em" type="email" placeholder="Email">
-  ${fg ? "" : '<input id="pw" type="password" placeholder="Password (6+ characters)">'}
-  <div class="err" id="er"></div>
-  <button id="go">${fg ? "Send reset link" : su ? "Sign up" : "Log in"}</button>
-  ${mode === "login" ? '<button class="g" id="fp">Forgot password?</button>' : ""}
-  <button class="g" id="sw">${mode === "login" ? "Create a new account" : "Back to log in"}</button></div>`;
-  $("sw").onclick = () => authScreen(mode === "login" ? "signup" : "login");
-  if ($("fp")) $("fp").onclick = () => authScreen("forgot");
-  $("go").onclick = async () => {
-    try {
-      if (fg) {
-        await api("/forgot", "POST", { email: $("em").value });
-        $("er").className = "okm"; $("er").textContent = "If that email is registered, a reset link has been sent. Check your inbox and spam folder.";
-        return;
-      }
-      setSession(await api(su ? "/signup" : "/login", "POST", { name: su ? $("nm").value : undefined, email: $("em").value, password: $("pw").value }));
-      home();
-    } catch (e) { $("er").textContent = e.message; }
-  };
-}
-function resetScreen(t) {
-  app.innerHTML = `<h1>Test Dealer</h1><div class="card"><h3>Choose a new password</h3>
-  <input id="pw" type="password" placeholder="New password (6+ characters)"><div class="err" id="er"></div>
-  <button id="go">Save password</button></div>`;
-  $("go").onclick = async () => {
-    try { setSession(await api("/reset", "POST", { token: t, password: $("pw").value })); history.replaceState({}, "", "/"); home(); }
-    catch (e) { $("er").textContent = e.message; }
-  };
-}
-
-// ---------- Home ----------
-function status(u) {
-  if (u.allUntil) return new Date(u.allUntil).getFullYear() > 2100 ? "All subjects unlocked for life ✅" : `All subjects unlocked until ${dt(u.allUntil)} ✅`;
-  const s = u.subjects.map(x => `${esc(x.name)} (until ${dt(x.until)})`).join(", ");
-  return (s ? "Unlocked: " + s + "<br>" : "") + "Free questions left: " + u.left;
-}
-async function home() {
-  try { user = await api("/me"); } catch { return authScreen(); }
-  const subjects = (await api("/subjects")).sort();
-  app.innerHTML = `<h1>Test Dealer</h1>
-  <div class="bar"><span>${esc(user.name || user.email)}</span><a href="#" id="lo">Log out</a></div>
-  <div class="card"><b>${status(user)}</b>
-  ${subjects.length ? `
-  <label><small>Subject</small><select id="sub">${subjects.map(s => `<option>${esc(s)}</option>`).join("")}</select></label>
-  <small>Free: 5 questions in total. After payment: 40 random questions in every exam.</small>
-  <div class="err" id="er"></div><button id="go">Start exam</button>` : "<p>No questions in the database yet.</p>"}
-  <div class="row"><button class="g" id="pl">Plans &amp; pricing</button><button class="g" id="hi">My scores</button></div></div>`;
-  $("lo").onclick = e => { e.preventDefault(); logout(); };
-  $("pl").onclick = () => plansScreen(); $("hi").onclick = historyScreen;
-  if ($("go")) $("go").onclick = startExam;
-}
-
-// ---------- Exam ----------
-async function startExam() {
-  const subject = $("sub").value;
-  try {
-    const j = await api("/exam/start", "POST", { subject });
-    ex = { id: j.examId, qs: j.questions, i: 0, ans: {}, t: j.seconds, done: false };
-    ex.timer = setInterval(() => { ex.t--; const e = $("tm"); if (e) e.textContent = fmt(ex.t); if (ex.t <= 0) submit(); }, 1000);
-    show();
-  } catch (e) { if (e.status === 402) return plansScreen(subject, true); $("er").textContent = e.message; }
-}
-function show() {
-  const q = ex.qs[ex.i];
-  app.innerHTML = `<div class="bar"><span>Question ${ex.i + 1}/${ex.qs.length} · ${esc(q.subject)}</span><span>⏱ <b id="tm">${fmt(ex.t)}</b></span></div>
-  <div class="card"><p><b>${esc(q.question)}</b></p>
-  ${q.options.map((o, k) => `<button class="opt ${ex.ans[q.id] === k ? "sel" : ""}" data-k="${k}">${"ABCD"[k]}. ${esc(o)}</button>`).join("")}</div>
-  <div class="row"><button class="g" id="pv" ${ex.i ? "" : "disabled"}>Previous</button>
-  ${ex.i < ex.qs.length - 1 ? '<button id="nx">Next</button>' : '<button id="fn">Submit</button>'}</div>`;
-  document.querySelectorAll(".opt").forEach(b => b.onclick = () => { ex.ans[q.id] = +b.dataset.k; show(); });
-  $("pv").onclick = () => { ex.i--; show(); };
-  if ($("nx")) $("nx").onclick = () => { ex.i++; show(); };
-  if ($("fn")) $("fn").onclick = () => { if (confirm("Submit exam?")) submit(); };
-}
-async function submit() {
-  if (ex.done) return; ex.done = true; clearInterval(ex.timer);
-  try {
-    const j = await api("/exam/submit", "POST", { examId: ex.id, answers: ex.ans });
-    user = j.user;
-    app.innerHTML = `<h1>Result</h1><div class="card"><p style="font-size:28px;margin:0"><b>${j.score}/${j.total}</b> (${Math.round(j.score / j.total * 100)}%)</p></div>
-    ${j.review.map((r, i) => `<div class="card"><p><b>${i + 1}. ${esc(r.question)}</b></p>
-    ${r.options.map((o, k) => `<div class="ans ${k === r.correct ? "ok" : r.picked === k ? "no" : ""}">${"ABCD"[k]}. ${esc(o)}${k === r.correct ? " ✔" : r.picked === k ? " ✘ (your answer)" : ""}</div>`).join("")}
-    ${r.picked === undefined ? "<small>You did not answer this one.</small>" : ""}
-    <div class="sol"><b>Solution:</b>\n${r.explanation ? esc(r.explanation) : "Solution coming soon."}</div></div>`).join("")}
-    <button id="hm">Back home</button>`;
-    $("hm").onclick = home;
-  } catch (e) { alert(e.message); home(); }
-}
-
-// ---------- Plans & payment ----------
-async function plansScreen(pre, ended) {
-  const [plans, subjects] = await Promise.all([api("/plans"), api("/subjects")]);
-  app.innerHTML = `<h1>Test Dealer</h1>
-  ${ended ? '<div class="card"><b>Your free questions are finished.</b> Choose a plan to keep practising.</div>' : ""}
-  ${Object.entries(plans).map(([k, p]) => `<div class="card"><b>${esc(p.label)}</b><div class="price">₦${p.naira.toLocaleString()}</div>
-  ${k === "subject" ? `<select id="psub">${subjects.sort().map(s => `<option ${s === pre ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>` : ""}
-  <button data-plan="${k}">Pay ₦${p.naira.toLocaleString()}</button></div>`).join("")}
-  <button class="g" id="bk">Back</button>`;
-  document.querySelectorAll("[data-plan]").forEach(b => b.onclick = () => payNow(b.dataset.plan, b.dataset.plan === "subject" ? $("psub").value : undefined));
-  $("bk").onclick = home;
-}
-async function payNow(plan, subject) {
-  try { const j = await api("/pay/init", "POST", { plan, subject }); location.href = j.url; }
-  catch (e) { alert(e.message); }
-}
-
-// ---------- Score history ----------
-async function historyScreen() {
-  const list = await api("/history");
-  app.innerHTML = `<h1>My scores</h1>
-  ${list.length ? list.map(h => `<div class="card"><b>${esc(h.subject)}</b> · ${dt(h.createdAt)}<br>${h.score}/${h.total} (${Math.round(h.score / h.total * 100)}%)</div>`).join("") : '<div class="card">No exams taken yet.</div>'}
-  <button id="bk">Back</button>`;
-  $("bk").onclick = home;
-}
-
-// ---------- Start ----------
-(async function init() {
-  const qp = new URLSearchParams(location.search);
-  if (qp.get("reset")) return resetScreen(qp.get("reset"));
-  if (!token) return authScreen();
-  const ref = qp.get("reference");
-  if (ref) {
-    try { user = await api("/pay/verify?reference=" + encodeURIComponent(ref)); } catch {}
-    history.replaceState({}, "", "/");
-    alert("Payment received. Your access has been updated!");
-  }
-  home();
-})();
-</script></body></html>
-*/});
-app.get("/", (req, res) => res.type("html").send(PAGE));
-
-/* ---------- Start the server (loads the 90 starter questions the first time) ---------- */
-async function startServer() {
-  try {
-    await mongoose.connect(C.MONGO_URI);
-    if (!(await Question.countDocuments())) {
-      await Question.insertMany(STARTER);
-      console.log("Loaded " + STARTER.length + " starter questions");
-    }
-    app.listen(C.PORT, () => console.log("Test Dealer running on port " + C.PORT));
-  } catch (e) { console.error("DB connection failed:", e.message); }
-}
-startServer();
+function explain(e) {
+  const t = String((e && e.message) || e);
+  if (/bad auth|Authentication failed/i.test(t)) return "MongoDB refused the username or password in your MONGO_URI. In MongoDB open Database Access, click Edit on your user, set a NEW password using only letters an
