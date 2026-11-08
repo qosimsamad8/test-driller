@@ -1,5 +1,5 @@
 /* ===================== TEST DEALER: ONE FILE =====================
-   Fill in the settings below, then run the app. */
+ 
 const C = {
   PORT: 3000,
   MONGO_URI: "placeholder",
@@ -10,9 +10,9 @@ const C = {
   FREE_LIMIT: 5,
   SMTP_HOST: "smtp.gmail.com",
   SMTP_PORT: 587,
-  SMTP_USER: "placeholder",
+  SMTP_USER: "qosimsamad8@gmail.com",
   SMTP_PASS: "placeholder",
-  MAIL_FROM: "Test Dealer <placeholder@example.com>",
+  MAIL_FROM: "cbtjamb <qosimsamad8@gmail.com>",
   ANTHROPIC_API_KEY: "placeholder",
 };
 for (const k in C) if (process.env[k]) C[k] = process.env[k]; // hosting environment variables override the above
